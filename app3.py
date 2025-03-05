@@ -30,20 +30,26 @@ st.set_page_config(
     layout="centered"
 )
 
-LOGO_PATH = "MP.png"  # Ajustar se necessário
-GLOSSARY_PATH = "Rubricas.txt"  # Ajustar se necessário
+LOGO_PATH = "MP.png"  # Ajuste se necessário
+GLOSSARY_PATH = "Rubricas.txt"  # Ajuste se necessário
 
+# Variável para armazenar valores importantes (fallback quando session_state não estiver disponível)
 _fallback_state = {
     "df_contracheques": None,
     "df_descontos": None,
     "df_descontos_gloss": None,
     "df_descontos_gloss_sel": None,
     "nome_extraido": "",
-    "nit_extraido": ""
+    "nit_extraido": "",
+    "valor_recebido": ""  # Para inserir o valor B = Valor Recebido
 }
 
 
 def get_state_value(key):
+    """
+    Recupera valor do st.session_state, se existir;
+    caso contrário, busca em _fallback_state.
+    """
     try:
         return st.session_state[key]
     except:
@@ -51,6 +57,9 @@ def get_state_value(key):
 
 
 def set_state_value(key, value):
+    """
+    Armazena valor em st.session_state (se disponível) ou em _fallback_state.
+    """
     try:
         st.session_state[key] = value
     except:
@@ -84,8 +93,22 @@ def carregar_glossario_rubricas():
 
 
 def sanitizar_para_arquivo(texto: str) -> str:
+    """
+    Remove caracteres indesejados para uso em nomes de arquivos.
+    """
     texto = texto.strip().replace(" ", "_")
     return re.sub(r"[^\w\-_\.]", "", texto, flags=re.UNICODE)
+
+
+def formatar_valor_brl(valor: str) -> str:
+    """
+    Converte valores do tipo "123,456.78" (ou variações) para padrão PT-BR "123.456,78".
+    """
+    try:
+        flt = float(valor.replace(",", "").replace(".", "")) / 100
+        return f"{flt:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except:
+        return valor
 
 
 # -----------------------------------------------------------------
@@ -93,7 +116,14 @@ def sanitizar_para_arquivo(texto: str) -> str:
 # -----------------------------------------------------------------
 def extrair_nome_e_matricula(pdf_path):
     """
-    Extrai Nome e Matrícula (MATRÍCULA-SEQ-DIG).
+    Extrai Nome e Matrícula (MATRÍCULA-SEQ-DIG) do PDF usando pdfplumber.
+    Exemplo de trecho que pode existir no PDF:
+      NOME
+      FULANO DE TAL
+      MATRÍCULA-SEQ-DIG
+      014.642-0 C
+    Retorna: (nome, matrícula).
+    Se não encontrar, retorna ("N/D", "N/D").
     """
     nome = "N/D"
     matricula = "N/D"
@@ -101,19 +131,23 @@ def extrair_nome_e_matricula(pdf_path):
         if len(pdf.pages) > 0:
             text = pdf.pages[0].extract_text() or ""
             lines = text.split("\n")
+
             for i, linha in enumerate(lines):
                 if "NOME" in linha.upper():
                     if i + 1 < len(lines):
                         valor_nome = lines[i + 1].strip()
+                        # Pega apenas parte textual sem números, se houver
                         match_nome = re.match(r"([^\d]+)", valor_nome)
                         if match_nome:
                             nome = match_nome.group(1).strip()
                 if "MATRÍCULA-SEQ-DIG" in linha.upper():
                     if i + 1 < len(lines):
                         valor_matr = lines[i + 1].strip()
+                        # Tenta casar algo como 014.642-0 C
                         matr_match = re.search(r"(\d{3}\.\d{3}-\d\s*[A-Z]*)", valor_matr)
                         if matr_match:
                             matricula = matr_match.group(1).strip()
+
     return nome or "N/D", matricula or "N/D"
 
 
@@ -121,6 +155,9 @@ def extrair_nome_e_matricula(pdf_path):
 # FUNÇÕES AUXILIARES CAMELOT
 # -----------------------------------------------------------------
 def extrair_data_da_pagina(pdf_path, page_number):
+    """
+    Utiliza PyPDF2 para extrair texto cru e procurar datas (MM/AAAA) em uma página específica.
+    """
     with open(pdf_path, 'rb') as f:
         reader = PdfReader(f)
         if page_number - 1 < len(reader.pages):
@@ -132,7 +169,9 @@ def extrair_data_da_pagina(pdf_path, page_number):
 
 
 def _separar_linhas_multiplas(df: pd.DataFrame) -> pd.DataFrame:
-    """Separa \n em múltiplas linhas do DataFrame."""
+    """
+    Separa texto com quebras de linha (\n) em múltiplas linhas do DataFrame.
+    """
     linhas_expandidas = []
     for _, row in df.iterrows():
         col_split = [str(row[col]).split('\n') for col in df.columns]
@@ -146,15 +185,11 @@ def _separar_linhas_multiplas(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(linhas_expandidas)
 
 
-# -----------------------------------------------------------------
-# PROCESSAR CONTRACHEQUES (CAMELOT)
-# -----------------------------------------------------------------
 def processar_contracheques_camelot(pdf_path):
     """
-    Lê tabelas do PDF com Camelot (flavor='stream') e retorna DataFrame:
-    "COD", "Descrição", "TOTAL", "DATA".
+    Lê tabelas do PDF com Camelot (flavor='stream') e retorna DataFrame
+    com colunas: "COD", "Descrição", "TOTAL", "DATA".
     """
-    import camelot
     try:
         tables = camelot.read_pdf(
             pdf_path,
@@ -164,9 +199,12 @@ def processar_contracheques_camelot(pdf_path):
             strip_text=''
         )
         dados = pd.DataFrame(
-            columns=["DATA", "Competência", "Descrição", "PVD", "COD", "BASE", "VALOR UNITÁRIO", "TOTAL"])
+            columns=["DATA", "Competência", "Descrição", "PVD", "COD", "BASE", "VALOR UNITÁRIO", "TOTAL"]
+        )
+
         for table in tables:
             df = table.df
+            # Verifica se existe a linha de cabeçalho com "DESCRIÇÃO"
             if "DESCRIÇÃO" in df.values:
                 idx_cab = df[df.isin(["DESCRIÇÃO"]).any(axis=1)].index[0]
                 df = df.iloc[idx_cab + 1:].reset_index(drop=True)
@@ -174,14 +212,18 @@ def processar_contracheques_camelot(pdf_path):
                     df.columns = ["Descrição", "PVD", "COD", "BASE", "VALOR UNITÁRIO", "TOTAL"][:df.shape[1]]
                 else:
                     continue
+
+                # Separa as linhas com \n
                 df = _separar_linhas_multiplas(df)
+
+                # Marca de qual página veio a tabela (Competência = Página X)
                 df["Competência"] = f"Página {table.page}"
                 data_encontrada = extrair_data_da_pagina(pdf_path, table.page)
-                df.insert(0, "DATA", data_encontrada)
+                df.insert(0, "DATA", data_encontrada)  # Insere DATA logo na 1ª posição
                 dados = pd.concat([dados, df], ignore_index=True)
 
         if not dados.empty:
-            # Reordena
+            # Reordena colunas para exibir final
             dados = dados[["COD", "Descrição", "TOTAL", "DATA"]]
         return dados
     except Exception as e:
@@ -190,27 +232,13 @@ def processar_contracheques_camelot(pdf_path):
 
 
 # -----------------------------------------------------------------
-# FORMATAR VALOR EM PT-BR
-# -----------------------------------------------------------------
-def formatar_valor_brl(valor: str) -> str:
-    """Converte "123,456.78" => "123.456,78" PT-BR."""
-    try:
-        flt = float(valor.replace(",", "").replace(".", "")) / 100
-        return f"{flt:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except:
-        return valor
-
-
-# -----------------------------------------------------------------
-# RELATÓRIO PDF "Tabelas (SEAD / AMAZONPREV)"
+# PDF “Tabelas (SEAD / AMAZONPREV)”
 # -----------------------------------------------------------------
 class PDFRelatorioCamelot(FPDF):
     """
-    PDF Paisagem, colunas: COD(30), DESCRIÇÃO(150), TOTAL(40), DATA(30).
-    - Ajuste especial p/ "HYDELVIDIA CAVALCANTE DE OLIVEIRA_014.642-0 C":
-      * Repetir config página 1 para todo o PDF
-      * Da segunda página em diante, remover 2ª linha do cabeçalho
-      * Texto sem negrito
+    Gera PDF em modo paisagem para exibir tabelas da SEAD / AMAZONPREV:
+    Colunas: COD(30), DESCRIÇÃO(150), TOTAL(40), DATA(30).
+    Possui cabeçalho e rodapé simples.
     """
 
     def __init__(self, titulo, nome_user, nit_user):
@@ -218,44 +246,26 @@ class PDFRelatorioCamelot(FPDF):
         self.titulo = titulo
         self.nome_user = nome_user
         self.nit_user = nit_user
-        # Ajuste das margens
+        # Ajustes de margem/página
         self.set_auto_page_break(auto=False, margin=15)
         self.set_left_margin(10)
         self.set_right_margin(10)
         self.set_top_margin(10)
-
         self.page_count = 0
-        # Flag se for HYDELVIDIA + "014.642-0 C"
-        self.is_hydelvidia = (
-                self.nome_user.strip().upper() == "HYDELVIDIA CAVALCANTE DE OLIVEIRA" and
-                "014.642-0 C" in self.nit_user
-        )
 
     def header(self):
         self.page_count += 1
         self.set_font('Arial', 'B', 12)
-        titulo_str = f"Contracheque - {self.nome_user} - {self.nit_user}"
+        titulo_str = f"{self.titulo} - {self.nome_user} - {self.nit_user}"
         self.cell(0, 10, titulo_str, border=False, ln=True, align='C')
         self.ln(5)
 
-        # Cabeçalho
-        if not self.is_hydelvidia:
-            self._draw_header_line(bold=True)
-        else:
-            # Se for HYDELVIDIA => usar config da pág 1, mas remover 2ª linha e bold
-            # a partir da 2ª página
-            if self.page_count == 1:
-                self._draw_header_line(bold=True)
-            else:
-                self._draw_header_line(bold=False)
+        # Cabeçalho de colunas
+        self._draw_header_line()
 
-    def _draw_header_line(self, bold=True):
-        if bold:
-            self.set_font("Arial", "B", 10)
-        else:
-            self.set_font("Arial", "", 10)
+    def _draw_header_line(self):
+        self.set_font("Arial", "B", 10)
         self.set_fill_color(200, 220, 255)
-        # Uma só linha do cabeçalho: COD(30), DESCRIÇÃO(150), TOTAL(40), DATA(30)
         header_cols = [
             ("COD", 30, "C"),
             ("Descrição", 150, "L"),
@@ -272,17 +282,22 @@ class PDFRelatorioCamelot(FPDF):
         self.cell(0, 10, f'Página {self.page_no()}', ln=False, align='C')
 
     def montar_tabela(self, df):
-        # Se for HYDELVIDIA e a partir da 2ª página => sem negrito
+        """
+        Escreve as linhas do DataFrame no PDF.
+        """
         row_h = 7
         self.set_font("Arial", "", 9)
+
         for _, rowv in df.iterrows():
-            if self.get_y() + row_h + 15 > self.h:
+            if self.get_y() + row_h + 15 > self.h:  # Evitar estouro de página
                 self.add_page()
 
             cod_s = str(rowv["COD"])
             desc_s = str(rowv["Descrição"])
             tot_s = str(rowv["TOTAL"])
             dat_s = str(rowv["DATA"])
+
+            # Formata campo de total
             if tot_s.strip():
                 tot_s = formatar_valor_brl(tot_s)
 
@@ -299,6 +314,9 @@ class PDFRelatorioCamelot(FPDF):
 
 
 def salvar_em_pdf_camelot(df, titulo_pdf, nome_user, nit_user) -> bytes:
+    """
+    Gera o PDF final (em bytes) das tabelas (SEAD / AMAZONPREV).
+    """
     pdf = PDFRelatorioCamelot(titulo_pdf, nome_user, nit_user)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
         out_path = tmp_pdf.name
@@ -310,11 +328,18 @@ def salvar_em_pdf_camelot(df, titulo_pdf, nome_user, nit_user) -> bytes:
 
 
 # -----------------------------------------------------------------
-# INSERIR TOTAIS NA COLUNA (SOMA e DOBRO)
+# FUNÇÃO para inserir linhas de total A/B e cálculo de indébito
 # -----------------------------------------------------------------
 def inserir_totais_na_coluna(df, col_valor="DESCONTOS"):
     """
-    Mantém a lógica exata de soma e dobro.
+    Insere linhas ao final da coluna 'col_valor' com:
+       - A = Valor Total (R$)
+       - B = Valor Recebido - Autor (a)
+       - Indébito (A-B)
+       - Indébito em dobro (R$)
+
+    O valor B é recuperado do estado ("valor_recebido").
+    Se não fornecido ou inválido, considera 0.
     """
 
     def _to_float(x):
@@ -323,24 +348,61 @@ def inserir_totais_na_coluna(df, col_valor="DESCONTOS"):
         except:
             return 0.0
 
+    # Soma de A
     soma = df[col_valor].apply(_to_float).sum()
     if soma == 0:
         return df
+
+    # Recupera B do estado
+    valor_recebido_str = get_state_value("valor_recebido") or "0"
+    try:
+        valor_recebido_num = float(valor_recebido_str.replace(',', '.').strip())
+    except:
+        valor_recebido_num = 0.0
+
+    # Indébito
+    indebito = soma - valor_recebido_num
+    indebito_dobro = 2 * indebito
+
+    # Formata para exibir
+    A_str = f"{soma:,.2f}"
+    B_str = valor_recebido_str.strip()
+    indebito_str = f"{indebito:,.2f}"
+    indebito_dobro_str = f"{indebito_dobro:,.2f}"
+
     df_novo = df.copy()
-    soma_str = f"{soma:,.2f}"
-    dobro_str = f"{(2 * soma):,.2f}"
+    # Linha A
     df_novo = pd.concat([
         df_novo,
-        pd.DataFrame({col_valor: [soma_str], "DESCRIÇÃO": ["Valor Total (R$)"]})
+        pd.DataFrame({col_valor: [A_str], "DESCRIÇÃO": ["A = Valor Total (R$)"]})
     ], ignore_index=True)
+    # Linha B
     df_novo = pd.concat([
         df_novo,
-        pd.DataFrame({col_valor: [dobro_str], "DESCRIÇÃO": ["Em dobro (R$)"]})
+        pd.DataFrame({col_valor: [B_str], "DESCRIÇÃO": ["B = Valor Recebido - Autor (a)"]})
     ], ignore_index=True)
-    mask_especial = df_novo["DESCRIÇÃO"].isin(["Valor Total (R$)", "Em dobro (R$)"])
+    # Linha Indébito
+    df_novo = pd.concat([
+        df_novo,
+        pd.DataFrame({col_valor: [indebito_str], "DESCRIÇÃO": ["Indébito (A-B)"]})
+    ], ignore_index=True)
+    # Linha Indébito em dobro
+    df_novo = pd.concat([
+        df_novo,
+        pd.DataFrame({col_valor: [indebito_dobro_str], "DESCRIÇÃO": ["Indébito em dobro (R$)"]})
+    ], ignore_index=True)
+
+    # Limpa demais colunas nas linhas especiais
+    mask_especial = df_novo["DESCRIÇÃO"].isin([
+        "A = Valor Total (R$)",
+        "B = Valor Recebido - Autor (a)",
+        "Indébito (A-B)",
+        "Indébito em dobro (R$)"
+    ])
     for c in df_novo.columns:
         if c not in ["DESCRIÇÃO", col_valor]:
             df_novo.loc[mask_especial, c] = ""
+
     return df_novo
 
 
@@ -349,8 +411,13 @@ def inserir_totais_na_coluna(df, col_valor="DESCONTOS"):
 # -----------------------------------------------------------------
 class PDFFinais(FPDF):
     """
-    PDF p/ "Descontos Finais", paisagem,
-    destaca “Valor Total (R$)” e “Em dobro (R$)” em vermelho e fonte 11.
+    PDF p/ "Descontos Finais", paisagem.
+    Destaca linhas especiais:
+      - A = Valor Total (R$)
+      - B = Valor Recebido - Autor (a)
+      - Indébito (A-B)
+      - Indébito em dobro (R$)
+    em vermelho (fonte 11, negrito).
     """
 
     def __init__(self, titulo):
@@ -391,6 +458,7 @@ class PDFFinais(FPDF):
             "DESCONTOS": 40,
             "DATA": 30
         }
+        # Desenha cabeçalho
         self.montar_cab(col_names, widths_map)
         self.set_font("Arial", "", 9)
 
@@ -400,7 +468,13 @@ class PDFFinais(FPDF):
                 self.montar_cab(col_names, widths_map)
 
             desc = rowv["DESCRIÇÃO"]
-            is_especial = desc in ["Valor Total (R$)", "Em dobro (R$)"]
+            is_especial = desc in [
+                "A = Valor Total (R$)",
+                "B = Valor Recebido - Autor (a)",
+                "Indébito (A-B)",
+                "Indébito em dobro (R$)"
+            ]
+
             if is_especial:
                 self.set_font("Arial", "B", 11)
                 self.set_text_color(255, 0, 0)
@@ -415,6 +489,7 @@ class PDFFinais(FPDF):
                     val = formatar_valor_brl(val)
                 row_vals.append(val)
 
+            # Imprime linha
             for col_h, valv in zip(col_names, row_vals):
                 w = widths_map.get(col_h, 40)
                 align = 'C'
@@ -451,18 +526,15 @@ def gerar_docx_finais(df: pd.DataFrame, titulo: str) -> bytes:
     """
     Gera DOCX com as mesmas configurações do PDF "Descontos Finais":
     - Orientação paisagem;
-    - Título com numeração ajustada (troca vírgula por ponto na numeração);
-    - Tabela com colunas: COD (30mm), DESCRIÇÃO (120mm), DESCONTOS (40mm) e DATA (30mm);
-    - Cabeçalho com fonte Arial, tamanho 10 e em negrito;
-    - Linhas "Valor Total (R$)" e "Em dobro (R$)" com fonte Arial, tamanho 11 e cor vermelha;
-    - Conversão de valores numéricos no campo DESCONTOS utilizando formatar_valor_brl.
+    - Título principal centralizado;
+    - Tabela com colunas: COD(30mm), DESCRIÇÃO(120mm), DESCONTOS(40mm), DATA(30mm);
+    - Linhas especiais (A/B/Indébito) em vermelho, tamanho 11, negrito;
+    - Converte valores de DESCONTOS para padrão PT-BR.
     """
     import re
-    from docx import Document
-    from docx.shared import Inches, Pt, RGBColor
-    from docx.enum.section import WD_ORIENT
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    # Ajusta o título: troca vírgula por ponto na numeração (Ex.: "14,642-0 C" passa a ser "14.642-0 C")
+
+    # Faz ajuste no título (eventual troca de vírgula por ponto, se quiser)
+    # Aqui mantemos a substituição para casos como "14,642-0" -> "14.642-0"
     titulo_ajust = re.sub(r"(\d+),(\d{3}-\d\s*[A-Za-z])", r"\1.\2", titulo)
 
     doc = Document()
@@ -472,6 +544,7 @@ def gerar_docx_finais(df: pd.DataFrame, titulo: str) -> bytes:
         section.page_width = new_width
         section.page_height = new_height
 
+    # Título
     titulo_heading = doc.add_heading(titulo_ajust, level=1)
     titulo_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
@@ -482,7 +555,6 @@ def gerar_docx_finais(df: pd.DataFrame, titulo: str) -> bytes:
         doc.save(buf)
         return buf.getvalue()
 
-    # Define as colunas conforme PDF "Descontos Finais"
     col_names = ["COD", "DESCRIÇÃO", "DESCONTOS", "DATA"]
     widths_map = {
         "COD": 30,
@@ -490,6 +562,7 @@ def gerar_docx_finais(df: pd.DataFrame, titulo: str) -> bytes:
         "DESCONTOS": 40,
         "DATA": 30
     }
+
     table = doc.add_table(rows=1, cols=len(col_names))
     table.style = 'Table Grid'
 
@@ -503,32 +576,42 @@ def gerar_docx_finais(df: pd.DataFrame, titulo: str) -> bytes:
                 run.font.name = "Arial"
                 run.font.size = Pt(10)
 
-    # Corpo da tabela
+    # Linhas
     for _, rowv in df.iterrows():
-        new_row = table.add_row().cells
-        for j, col in enumerate(col_names):
-            val = str(rowv.get(col, ""))
-            if col == "DESCONTOS" and val.strip():
-                # Formata o valor conforme função utilizada no PDF (ex.: "2,874.70" para "2.874,70")
+        row_cells = table.add_row().cells
+        desc_val = rowv.get("DESCRIÇÃO", "")
+        is_especial = desc_val in [
+            "A = Valor Total (R$)",
+            "B = Valor Recebido - Autor (a)",
+            "Indébito (A-B)",
+            "Indébito em dobro (R$)"
+        ]
+
+        for j, col_h in enumerate(col_names):
+            val = str(rowv.get(col_h, ""))
+            if col_h == "DESCONTOS" and val.strip():
                 val = formatar_valor_brl(val)
-            para = new_row[j].paragraphs[0]
+
+            para = row_cells[j].paragraphs[0]
             run = para.add_run(val)
             run.font.name = "Arial"
-            # Se a linha for especial ("Valor Total (R$)" ou "Em dobro (R$)"), aplicar formatação em vermelho, tamanho 11 e negrito
-            if rowv.get("DESCRIÇÃO", "") in ["Valor Total (R$)", "Em dobro (R$)"]:
+
+            if is_especial:
                 run.font.bold = True
                 run.font.size = Pt(11)
                 run.font.color.rgb = RGBColor(255, 0, 0)
             else:
                 run.font.size = Pt(9)
-            if col == "DESCRIÇÃO":
+                run.font.color.rgb = RGBColor(0, 0, 0)
+
+            if col_h == "DESCRIÇÃO":
                 para.alignment = WD_ALIGN_PARAGRAPH.LEFT
             else:
                 para.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    # Ajusta larguras das colunas (converte mm para polegadas)
-    for i, col in enumerate(col_names):
-        width_inches = widths_map[col] / 25.4
+    # Ajusta larguras (mm -> inches)
+    for i, col_h in enumerate(col_names):
+        width_inches = widths_map[col_h] / 25.4
         table.columns[i].width = Inches(width_inches)
 
     buf = BytesIO()
@@ -538,7 +621,8 @@ def gerar_docx_finais(df: pd.DataFrame, titulo: str) -> bytes:
 
 def ajustar_valores_docx(file_input_bytes: bytes) -> bytes:
     """
-    Função original mantida, mas não será utilizada na geração final do DOCX.
+    Exemplo de função para varrer o DOCX e ajustar valores, se necessário.
+    Aqui não está sendo usada, mas mantida como referência.
     """
     import re
     from docx import Document
@@ -558,7 +642,6 @@ def ajustar_valores_docx(file_input_bytes: bytes) -> bytes:
                 val_br = f"{base_float:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
             except:
                 val_br = val_us
-
             para.text = para.text.replace(val_us, val_br)
 
     doc.save(out_path)
@@ -573,6 +656,10 @@ def ajustar_valores_docx(file_input_bytes: bytes) -> bytes:
 # CRUZAR DESCONTOS COM GLOSSÁRIO
 # -----------------------------------------------------------------
 def cruzar_descontos_com_rubricas(df_descontos, rubricas, threshold=85):
+    """
+    Faz fuzzy matching das colunas 'DESCRIÇÃO' em df_descontos com a lista de rubricas,
+    mantendo apenas as que atingirem a similaridade mínima (threshold).
+    """
     if df_descontos.empty or not rubricas:
         return pd.DataFrame()
 
@@ -612,6 +699,7 @@ def main():
         type="pdf"
     )
 
+    # Se o usuário enviou um PDF, processa...
     if uploaded_pdf is not None:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
             tmp_file.write(uploaded_pdf.read())
@@ -626,13 +714,17 @@ def main():
             # Ler tabelas Camelot
             df_contra = processar_contracheques_camelot(pdf_path)
             set_state_value("df_contracheques", df_contra)
+
         finally:
+            # Remove o arquivo temporário do PDF original
             os.unlink(pdf_path)
 
+    # Recupera DataFrame e nome/nit do estado
     df_contra = get_state_value("df_contracheques")
     nome_user = get_state_value("nome_extraido") or "ND"
     nit_user = get_state_value("nit_extraido") or "ND"
 
+    # Se DataFrame não é vazio, exibe sucesso e segue fluxo
     if df_contra is not None and not df_contra.empty:
         st.success("PDF processado com sucesso!")
 
@@ -640,7 +732,7 @@ def main():
         st.subheader("Tabelas (SEAD / AMAZONPREV)")
         st.dataframe(df_contra)
 
-        # Gerar PDF Tabelas
+        # Botão de Download PDF dessas Tabelas
         pdf_tab_bytes = salvar_em_pdf_camelot(
             df_contra,
             "Tabelas (SEAD / AMAZONPREV)",
@@ -671,6 +763,7 @@ def main():
             btn_gloss = st.form_submit_button("Filtrar com Rubricas")
 
         if btn_gloss:
+            # Ajusta colunas para padronizar => "DESCRIÇÃO", "DESCONTOS"
             df_aux = df_contra.copy()
             df_aux.rename(columns={
                 "Descrição": "DESCRIÇÃO",
@@ -716,19 +809,25 @@ def main():
                 else:
                     st.warning("Nenhuma descrição selecionada.")
 
-            # Apresentar Rúbricas p/ Débitos (Descontos Finais)
+            # Apresentar Rúbricas para Débitos (Descontos Finais)
             df_final_sel = get_state_value("df_descontos_gloss_sel")
             if df_final_sel is not None and not df_final_sel.empty:
                 st.markdown("## Apresentar Rúbricas para Débitos (Descontos Finais)")
+
+                # Input para B = Valor Recebido
+                valor_receb_input = st.text_input("B = Valor Recebido - Autor (a)", "0")
+                set_state_value("valor_recebido", valor_receb_input)
+
                 with st.form("form_descontos_finais"):
                     btn_final = st.form_submit_button("Gerar Relatório Final de Descontos")
 
                 if btn_final:
                     df_final = df_final_sel.copy()
+                    # Ordena por DATA, se existir
                     if "DATA" in df_final.columns:
                         df_final = df_final.sort_values(by="DATA").reset_index(drop=True)
 
-                    # Soma e dobro
+                    # Insere as linhas A/B/Indébito
                     df_final = inserir_totais_na_coluna(df_final, "DESCONTOS")
 
                     # Gera PDF Finais
@@ -742,7 +841,7 @@ def main():
                         mime="application/pdf"
                     )
 
-                    # Gera DOCX Finais utilizando as configurações do PDF "Descontos Finais"
+                    # Gera DOCX Finais
                     docx_bytes = gerar_docx_finais(df_final, final_title)
                     docx_fin_name = pdf_fin_name.replace(".pdf", ".docx")
                     st.download_button(
@@ -753,10 +852,10 @@ def main():
                     )
 
     else:
+        # Se df_contra não existe mas o usuário não enviou PDF ou processou sem sucesso
         if df_contra is not None:
             st.warning("Não foi possível extrair dados do PDF ou o PDF está vazio.")
 
 
 if __name__ == "__main__":
     main()
-
